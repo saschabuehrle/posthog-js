@@ -15,11 +15,13 @@ import {
     PAUSED,
 } from '../../../extensions/replay/external/triggerMatching'
 import { SessionRecordingTriggerGroup } from '../../../types'
+import { matchTriggerPropertyFilters } from '../../../utils/property-utils'
 import { createMockPostHog } from '../../helpers/posthog-instance'
 
 const fakePostHog = createMockPostHog({
     register_for_session: () => {},
     onFeatureFlags: () => () => {}, // Returns cleanup function
+    get_property: () => undefined,
 })
 
 // Shared test helper: Creates a mock TriggerGroupMatching with optional overrides
@@ -121,6 +123,131 @@ describe('V2 Trigger Groups', () => {
 
             const matcher = new TriggerGroupMatching(fakePostHog, group, () => {})
             expect(matcher.group.minDurationMs).toBe(0)
+        })
+    })
+
+    describe('matchTriggerPropertyFilters', () => {
+        it('returns true when no filters are provided', () => {
+            expect(matchTriggerPropertyFilters(undefined, {}, {})).toBe(true)
+            expect(matchTriggerPropertyFilters([], {}, {})).toBe(true)
+        })
+
+        it('matches event property with exact operator', () => {
+            const filters = [{ key: 'amount', type: 'event' as const, operator: 'exact' as const, value: '100' }]
+            expect(matchTriggerPropertyFilters(filters, { amount: '100' }, {})).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, { amount: '200' }, {})).toBe(false)
+        })
+
+        it('matches person property with exact operator', () => {
+            const filters = [{ key: 'country', type: 'person' as const, operator: 'exact' as const, value: 'US' }]
+            expect(matchTriggerPropertyFilters(filters, {}, { country: 'US' })).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, { country: 'US' }, {})).toBe(false) // wrong source
+        })
+
+        it('matches with icontains operator', () => {
+            const filters = [{ key: 'path', type: 'event' as const, operator: 'icontains' as const, value: 'checkout' }]
+            expect(matchTriggerPropertyFilters(filters, { path: '/CHECKOUT/step-1' }, {})).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, { path: '/settings' }, {})).toBe(false)
+        })
+
+        it('matches with gt operator', () => {
+            const filters = [{ key: 'amount', type: 'event' as const, operator: 'gt' as const, value: '100' }]
+            expect(matchTriggerPropertyFilters(filters, { amount: 200 }, {})).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, { amount: 50 }, {})).toBe(false)
+        })
+
+        it('matches with regex operator', () => {
+            const filters = [{ key: 'url', type: 'event' as const, operator: 'regex' as const, value: '^/checkout/.*' }]
+            expect(matchTriggerPropertyFilters(filters, { url: '/checkout/step-1' }, {})).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, { url: '/settings' }, {})).toBe(false)
+        })
+
+        it('ANDs multiple filters together', () => {
+            const filters = [
+                { key: 'amount', type: 'event' as const, operator: 'gt' as const, value: '100' },
+                { key: 'country', type: 'person' as const, operator: 'exact' as const, value: 'US' },
+            ]
+            expect(matchTriggerPropertyFilters(filters, { amount: 200 }, { country: 'US' })).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, { amount: 200 }, { country: 'UK' })).toBe(false) // person fails
+            expect(matchTriggerPropertyFilters(filters, { amount: 50 }, { country: 'US' })).toBe(false) // event fails
+        })
+
+        it('ORs multiple values within a single filter', () => {
+            const filters = [
+                { key: 'country', type: 'person' as const, operator: 'exact' as const, value: ['US', 'UK'] },
+            ]
+            expect(matchTriggerPropertyFilters(filters, {}, { country: 'US' })).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, {}, { country: 'UK' })).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, {}, { country: 'DE' })).toBe(false)
+        })
+
+        it('returns false when property is missing', () => {
+            const filters = [{ key: 'amount', type: 'event' as const, operator: 'exact' as const, value: '100' }]
+            expect(matchTriggerPropertyFilters(filters, {}, {})).toBe(false)
+        })
+
+        it('defaults to exact when operator is not provided', () => {
+            const filters = [{ key: 'status', type: 'event' as const, value: 'error' }]
+            expect(matchTriggerPropertyFilters(filters, { status: 'error' }, {})).toBe(true)
+            expect(matchTriggerPropertyFilters(filters, { status: 'ok' }, {})).toBe(false)
+        })
+    })
+
+    describe('Event trigger property evaluation', () => {
+        it('activates when event name matches and no properties', () => {
+            const group: SessionRecordingTriggerGroup = {
+                id: 'test',
+                name: 'Test',
+                sampleRate: 1.0,
+                conditions: {
+                    matchType: 'any',
+                    events: [{ name: 'purchase' }],
+                },
+            }
+
+            const matcher = new TriggerGroupMatching(fakePostHog, group, () => {})
+            const onActivate = jest.fn()
+            matcher.checkEventTriggerConditions('purchase', onActivate, 'session-1')
+            expect(onActivate).toHaveBeenCalledWith('event', 'purchase')
+        })
+
+        it('does not activate when event name does not match', () => {
+            const group: SessionRecordingTriggerGroup = {
+                id: 'test',
+                name: 'Test',
+                sampleRate: 1.0,
+                conditions: {
+                    matchType: 'any',
+                    events: [{ name: 'purchase' }],
+                },
+            }
+
+            const matcher = new TriggerGroupMatching(fakePostHog, group, () => {})
+            const onActivate = jest.fn()
+            matcher.checkEventTriggerConditions('pageview', onActivate, 'session-1')
+            expect(onActivate).not.toHaveBeenCalled()
+        })
+
+        it('activates on event name match regardless of properties (property filtering is in the strategy)', () => {
+            const group: SessionRecordingTriggerGroup = {
+                id: 'test',
+                name: 'Test',
+                sampleRate: 1.0,
+                conditions: {
+                    matchType: 'any',
+                    events: [
+                        {
+                            name: 'purchase',
+                            properties: [{ key: 'amount', type: 'event', operator: 'gt', value: '100' }],
+                        },
+                    ],
+                },
+            }
+
+            const matcher = new TriggerGroupMatching(fakePostHog, group, () => {})
+            const onActivate = jest.fn()
+            matcher.checkEventTriggerConditions('purchase', onActivate, 'session-1')
+            expect(onActivate).toHaveBeenCalledWith('event', 'purchase')
         })
     })
 

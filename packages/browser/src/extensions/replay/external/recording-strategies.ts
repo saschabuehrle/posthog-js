@@ -13,6 +13,7 @@ import {
     SESSION_RECORDING_TRIGGER_V2_GROUP_EVENT_PREFIX,
     SESSION_RECORDING_TRIGGER_V2_GROUP_URL_PREFIX,
     SESSION_RECORDING_TRIGGER_V2_GROUP_SAMPLING_PREFIX,
+    STORED_PERSON_PROPERTIES_KEY,
 } from '../../../constants'
 import {
     EventTriggerMatching,
@@ -33,6 +34,7 @@ import {
 import { sampleOnProperty } from '../../sampling'
 import { isBoolean, isNull, isNullish, isNumber } from '@posthog/core'
 import { createLogger } from '../../../utils/logger'
+import { matchTriggerPropertyFilters } from '../../../utils/property-utils'
 
 const logger = createLogger('[SessionRecording]')
 
@@ -369,10 +371,18 @@ export class V2TriggerGroupStrategy implements RecordingStrategy {
             matcher.checkUrlTriggerConditions(
                 onPause,
                 onResume,
-                (triggerType) => {
-                    // Use per-group activation instead of global V1 _activateTrigger
+                (triggerType, matchDetail) => {
+                    // V2: Check URL property filters before activating
+                    const urlTriggers = matcher.group.conditions.urls || []
+                    const matchedTrigger = urlTriggers.find((t) => matchDetail?.match(new RegExp(t.url)))
+                    if (matchedTrigger?.properties && matchedTrigger.properties.length > 0) {
+                        const personProperties = this._instance.get_property(STORED_PERSON_PROPERTIES_KEY)
+                        if (!matchTriggerPropertyFilters(matchedTrigger.properties, undefined, personProperties)) {
+                            return // URL regex matched but property filters failed
+                        }
+                    }
+
                     matcher.activateTrigger(triggerType, sessionId)
-                    // Update session properties after activation
                     this.updateActiveTriggers(sessionId)
                 },
                 sessionId
@@ -403,6 +413,22 @@ export class V2TriggerGroupStrategy implements RecordingStrategy {
                     matcher.checkEventTriggerConditions(
                         event.event,
                         (triggerType) => {
+                            // V2: Check event property filters before activating
+                            const eventTriggers = matcher.group.conditions.events || []
+                            const matchedTrigger = eventTriggers.find((t) => t.name === event.event)
+                            if (matchedTrigger?.properties && matchedTrigger.properties.length > 0) {
+                                const personProperties = this._instance.get_property(STORED_PERSON_PROPERTIES_KEY)
+                                if (
+                                    !matchTriggerPropertyFilters(
+                                        matchedTrigger.properties,
+                                        event.properties,
+                                        personProperties
+                                    )
+                                ) {
+                                    return // Event name matched but property filters failed
+                                }
+                            }
+
                             matcher.activateTrigger(triggerType, sessionId)
                             this.updateActiveTriggers(sessionId)
                         },
